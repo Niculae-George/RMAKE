@@ -33,6 +33,19 @@ fn name_for(path: &Path, name: Option<&str>) -> Result<String> {
 }
 
 pub fn create_new(path: &Path, name: Option<&str>, language: Language) -> Result<PathBuf> {
+    create_new_kind(path, name, language, false)
+}
+
+pub fn create_new_library(path: &Path, name: Option<&str>, language: Language) -> Result<PathBuf> {
+    create_new_kind(path, name, language, true)
+}
+
+fn create_new_kind(
+    path: &Path,
+    name: Option<&str>,
+    language: Language,
+    library: bool,
+) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -65,7 +78,7 @@ pub fn create_new(path: &Path, name: Option<&str>, language: Language) -> Result
         Err(e) => return Err(error(&absolute, "inspect directory", e)),
     };
     fs::create_dir_all(&absolute).map_err(|e| error(&absolute, "create project", e))?;
-    let result = init(&absolute, Some(&name), language);
+    let result = init_kind(&absolute, Some(&name), language, library);
     if result.is_err() && !existed {
         // Only remove a directory we created if rollback left it empty.
         let _ = fs::remove_dir(&absolute);
@@ -74,6 +87,19 @@ pub fn create_new(path: &Path, name: Option<&str>, language: Language) -> Result
 }
 
 pub fn init(path: &Path, name: Option<&str>, language: Language) -> Result<PathBuf> {
+    init_kind(path, name, language, false)
+}
+
+pub fn init_library(path: &Path, name: Option<&str>, language: Language) -> Result<PathBuf> {
+    init_kind(path, name, language, true)
+}
+
+fn init_kind(
+    path: &Path,
+    name: Option<&str>,
+    language: Language,
+    library: bool,
+) -> Result<PathBuf> {
     let root = path
         .canonicalize()
         .map_err(|e| error(path, "resolve project", e))?;
@@ -101,9 +127,22 @@ pub fn init(path: &Path, name: Option<&str>, language: Language) -> Result<PathB
             "src must be a real directory; init does not follow source-root symlinks",
         ));
     }
+    let library_markers = ["lib.c", "lib.cpp"]
+        .iter()
+        .any(|name| src.join(name).is_file());
+    let app_markers = ["main.c", "main.cpp"]
+        .iter()
+        .any(|name| src.join(name).is_file());
     let has_marker = ["main.c", "main.cpp", "lib.c", "lib.cpp"]
         .iter()
         .any(|name| src.join(name).is_file());
+    if library && app_markers {
+        return Err(Diagnostic::new(
+            "RMAKE-N106",
+            "init --lib found a conventional binary entry point; preserve it and use init without --lib",
+        ));
+    }
+    let has_include = root.join("include").is_dir();
     let seed = if has_marker {
         // Validate ambiguity, boundaries and unsupported library layouts before writing anything.
         manifest::parse_project(&manifest_path, &text)?;
@@ -116,22 +155,71 @@ pub fn init(path: &Path, name: Option<&str>, language: Language) -> Result<PathB
     } else {
         true
     };
+    if library && !seed && !library_markers {
+        return Err(Diagnostic::new(
+            "RMAKE-N106",
+            "init --lib requires conventional src/lib.c or src/lib.cpp when native sources already exist",
+        ));
+    }
+    let include = root.join("include");
+    if fs::symlink_metadata(&include)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+    {
+        return Err(Diagnostic::new(
+            "RMAKE-N105",
+            "include must be a real directory; init does not follow include-root symlinks",
+        ));
+    }
     let mut created = Vec::new();
     let src_created = seed && !src.exists();
+    let include_created = library && seed && !has_include;
     let outcome = (|| {
         if seed {
             fs::create_dir_all(&src).map_err(|e| error(&src, "create sources", e))?;
-            let (filename, source) = match language {
-                Language::C => (
-                    "main.c",
-                    "#include <stdio.h>\n\nint main(void) {\n    puts(\"Hello from RMake!\");\n    return 0;\n}\n",
-                ),
-                Language::Cpp => (
-                    "main.cpp",
-                    "#include <iostream>\n\nint main() {\n    std::cout << \"Hello from RMake!\\n\";\n    return 0;\n}\n",
-                ),
-            };
-            write_new(&src.join(filename), source.as_bytes(), &mut created)?;
+            if library {
+                fs::create_dir_all(&include).map_err(|e| error(&include, "create includes", e))?;
+                let mut stem = name.replace('-', "_");
+                if stem.as_bytes()[0].is_ascii_digit() {
+                    stem.insert_str(0, "rmake_");
+                }
+                let (filename, source) = match language {
+                    Language::C => (
+                        "lib.c",
+                        format!(
+                            "#include \"{stem}.h\"\n\nint {stem}_answer(void) {{\n    return 42;\n}}\n"
+                        ),
+                    ),
+                    Language::Cpp => (
+                        "lib.cpp",
+                        format!(
+                            "#include \"{stem}.h\"\n\nint {stem}_answer() {{\n    return 42;\n}}\n"
+                        ),
+                    ),
+                };
+                write_new(&src.join(filename), source.as_bytes(), &mut created)?;
+                let header = format!(
+                    "#ifndef RMAKE_{}_H\n#define RMAKE_{}_H\n\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\nint {stem}_answer(void);\n#ifdef __cplusplus\n}}\n#endif\n\n#endif\n",
+                    stem.to_ascii_uppercase(),
+                    stem.to_ascii_uppercase()
+                );
+                write_new(
+                    &include.join(format!("{stem}.h")),
+                    header.as_bytes(),
+                    &mut created,
+                )?;
+            } else {
+                let (filename, source) = match language {
+                    Language::C => (
+                        "main.c",
+                        "#include <stdio.h>\n\nint main(void) {\n    puts(\"Hello from RMake!\");\n    return 0;\n}\n",
+                    ),
+                    Language::Cpp => (
+                        "main.cpp",
+                        "#include <iostream>\n\nint main() {\n    std::cout << \"Hello from RMake!\\n\";\n    return 0;\n}\n",
+                    ),
+                };
+                write_new(&src.join(filename), source.as_bytes(), &mut created)?;
+            }
         }
         write_new(&manifest_path, text.as_bytes(), &mut created)?;
         let ignore = root.join(".gitignore");
@@ -146,6 +234,9 @@ pub fn init(path: &Path, name: Option<&str>, language: Language) -> Result<PathB
         }
         if src_created {
             let _ = fs::remove_dir(&src);
+        }
+        if include_created {
+            let _ = fs::remove_dir(&include);
         }
     }
     outcome

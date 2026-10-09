@@ -11,6 +11,9 @@ toml.workspace = true
 walkdir.workspace = true
 globset.workspace = true
 tempfile.workspace = true
+blake3.workspace = true
+nix.workspace = true
+ctrlc.workspace = true
 
 [lints]
 workspace = true

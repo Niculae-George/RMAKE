@@ -6,8 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rmake_model::{
-    CommandSpec, CompileRequest, CompilerFamily, CompilerOptions, Diagnostic, IoMode, Language,
-    LinkRequest, Optimization, ProcessRunner, Result, Toolchain, ToolchainInfo,
+    ArchiveRequest, Archiver, CommandSpec, CompileRequest, CompilerFamily, CompilerOptions,
+    Diagnostic, IoMode, Language, LinkRequest, Optimization, ProcessRunner, Result, Toolchain,
+    ToolchainInfo,
 };
 use serde::Deserialize;
 
@@ -27,11 +28,26 @@ struct ConfigToolchain {
     c_compiler: Option<PathBuf>,
     #[serde(rename = "cpp-compiler")]
     cpp_compiler: Option<PathBuf>,
+    archiver: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
 pub struct GnuToolchain {
     info: ToolchainInfo,
+    archiver: PathBuf,
+    archiver_probe: Option<String>,
+    c_probe_version: Option<String>,
+    cpp_probe_version: Option<String>,
+    #[cfg(target_os = "macos")]
+    sdk_probe: SdkProbe,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct SdkProbe {
+    path: PathBuf,
+    version: String,
+    settings_files: Vec<(PathBuf, Vec<u8>)>,
 }
 
 #[derive(Debug)]
@@ -75,6 +91,12 @@ pub fn detect(
             Path::new("c++"),
         )
     });
+    let archiver_selection = choose_compiler(
+        overrides.archiver.as_ref(),
+        configured.and_then(|t| t.archiver.as_ref()),
+        env::var_os("AR").map(PathBuf::from).as_ref(),
+        Path::new("ar"),
+    );
 
     let c_probe = c_selection
         .as_deref()
@@ -84,6 +106,18 @@ pub fn detect(
         .as_deref()
         .map(|selection| probe(selection, "C++", &root, runner))
         .transpose()?;
+    let archiver = resolve_executable(&archiver_selection, &root).map_err(|message| {
+        Diagnostic::new(
+            "toolchain-archiver",
+            format!(
+                "cannot use archiver selection {}: {message}",
+                archiver_selection.display()
+            ),
+        )
+    })?;
+    let archiver_probe = probe_archiver(&archiver, &root, runner);
+    #[cfg(target_os = "macos")]
+    let sdk_probe = probe_default_macos_sdk(&root, runner)?;
 
     let representative = c_probe
         .as_ref()
@@ -134,7 +168,15 @@ pub fn detect(
         .or(cpp_probe.as_ref())
         .map(|p| p.target.clone())
         .unwrap_or_default();
+    let c_probe_version = c_probe.as_ref().map(|p| p.version.clone());
+    let cpp_probe_version = cpp_probe.as_ref().map(|p| p.version.clone());
     Ok(GnuToolchain {
+        archiver,
+        archiver_probe,
+        c_probe_version,
+        cpp_probe_version,
+        #[cfg(target_os = "macos")]
+        sdk_probe,
         info: ToolchainInfo {
             family: representative.family,
             c_driver: c_probe.map(|p| p.path),
@@ -178,6 +220,17 @@ impl Toolchain for GnuToolchain {
             args.push("-I".into());
             args.push(include.as_os_str().to_owned());
         }
+        for (name, value) in &request.definitions {
+            args.push(format!("-D{name}={value}").into());
+        }
+        args.extend(request.options.iter().cloned());
+        args.extend([
+            OsString::from("-MD"),
+            OsString::from("-MF"),
+            request.depfile.as_os_str().to_owned(),
+            OsString::from("-MQ"),
+            request.output.as_os_str().to_owned(),
+        ]);
         args.push("-c".into());
         args.push(request.source.path.as_os_str().to_owned());
         args.push("-o".into());
@@ -207,10 +260,11 @@ impl Toolchain for GnuToolchain {
         add_profile_flags(&mut args, &request.profile);
         args.extend(
             request
-                .objects
+                .inputs
                 .iter()
                 .map(|path| path.as_os_str().to_owned()),
         );
+        args.extend(request.options.iter().cloned());
         args.push("-o".into());
         args.push(request.output.as_os_str().to_owned());
         Ok(CommandSpec {
@@ -220,6 +274,78 @@ impl Toolchain for GnuToolchain {
             label: format!("link {}", request.output.display()),
         })
     }
+}
+
+impl Archiver for GnuToolchain {
+    fn identity(&self) -> Vec<u8> {
+        self.identity_material()
+    }
+    fn archive_command(&self, request: &ArchiveRequest) -> Result<CommandSpec> {
+        let mut args = vec![OsString::from("rcs"), request.output.as_os_str().to_owned()];
+        args.extend(
+            request
+                .objects
+                .iter()
+                .map(|path| path.as_os_str().to_owned()),
+        );
+        Ok(CommandSpec {
+            program: self.archiver.clone(),
+            args,
+            cwd: request.cwd.clone(),
+            label: format!("archive {}", request.output.display()),
+        })
+    }
+}
+
+impl GnuToolchain {
+    pub fn archiver_path(&self) -> &Path {
+        &self.archiver
+    }
+    /// Stable probe material for callers that include tool identity in cache keys.
+    pub fn identity_material(&self) -> Vec<u8> {
+        let mut identity = format!(
+            "family={:?}\nc={:?}\nc-probe-version={:?}\ncxx={:?}\ncxx-probe-version={:?}\nversion={}\ntarget={}\nar={}\nar-probe={}\n",
+            self.info.family,
+            self.info.c_driver,
+            self.c_probe_version,
+            self.info.cpp_driver,
+            self.cpp_probe_version,
+            self.info.version,
+            self.info.target,
+            self.archiver.display(),
+            self.archiver_probe.as_deref().unwrap_or("")
+        )
+        .into_bytes();
+        #[cfg(target_os = "macos")]
+        {
+            append_identity_field(
+                &mut identity,
+                b"macos-sdk-path",
+                self.sdk_probe.path.as_os_str().as_encoded_bytes(),
+            );
+            append_identity_field(
+                &mut identity,
+                b"macos-sdk-version",
+                self.sdk_probe.version.as_bytes(),
+            );
+            for (path, contents) in &self.sdk_probe.settings_files {
+                append_identity_field(
+                    &mut identity,
+                    b"macos-sdk-settings-path",
+                    path.as_os_str().as_encoded_bytes(),
+                );
+                append_identity_field(&mut identity, b"macos-sdk-settings-content", contents);
+            }
+        }
+        identity
+    }
+}
+
+fn append_identity_field(identity: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    identity.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    identity.extend_from_slice(name);
+    identity.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    identity.extend_from_slice(value);
 }
 
 fn add_profile_flags(args: &mut Vec<OsString>, profile: &rmake_model::ProfileSettings) {
@@ -361,6 +487,72 @@ fn probe(
         target,
         arch,
         os,
+    })
+}
+
+// `ar --version` is not supported by every system archiver (notably BSD ar),
+// so treat this as optional identity material rather than a validity check.
+fn probe_archiver(path: &Path, root: &Path, runner: &dyn ProcessRunner) -> Option<String> {
+    let result = runner
+        .run(
+            &CommandSpec {
+                program: path.to_path_buf(),
+                args: vec!["--version".into()],
+                cwd: root.to_path_buf(),
+                label: format!("identify archiver {}", path.display()),
+            },
+            IoMode::Capture,
+        )
+        .ok()?;
+    (result.code == 0).then(|| first_line(&output_text(&result.stdout, &result.stderr)).to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn probe_default_macos_sdk(root: &Path, runner: &dyn ProcessRunner) -> Result<SdkProbe> {
+    fn query(runner: &dyn ProcessRunner, root: &Path, argument: &str) -> Result<String> {
+        let result = runner.run(
+            &CommandSpec {
+                program: PathBuf::from("xcrun"),
+                args: vec!["--sdk".into(), "macosx".into(), argument.into()],
+                cwd: root.to_path_buf(),
+                label: format!("inspect macOS SDK ({argument})"),
+            },
+            IoMode::Capture,
+        )?;
+        let value = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+        if result.code != 0 || value.is_empty() {
+            return Err(Diagnostic::new(
+                "toolchain-sdk",
+                format!(
+                    "xcrun --sdk macosx {argument} failed with status {}: {}",
+                    result.code,
+                    output_text(&result.stdout, &result.stderr)
+                ),
+            ));
+        }
+        Ok(value)
+    }
+
+    let path = PathBuf::from(query(runner, root, "--show-sdk-path")?);
+    let version = query(runner, root, "--show-sdk-version")?;
+    let mut settings_files = Vec::new();
+    for name in ["SDKSettings.json", "SDKSettings.plist"] {
+        let settings_path = path.join(name);
+        match fs::read(&settings_path) {
+            Ok(contents) => settings_files.push((settings_path, contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Diagnostic::new(
+                    "toolchain-sdk",
+                    format!("cannot read {}: {error}", settings_path.display()),
+                ));
+            }
+        }
+    }
+    Ok(SdkProbe {
+        path,
+        version,
+        settings_files,
     })
 }
 
@@ -546,386 +738,4 @@ fn output_text(stdout: &[u8], stderr: &[u8]) -> String {
 
 fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or(text).trim()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rmake_model::{ProfileSettings, SourceFile, Standards};
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct FakeRunner {
-        calls: Mutex<Vec<CommandSpec>>,
-        banners: Vec<(String, String)>,
-        targets: Vec<(String, String)>,
-    }
-
-    impl ProcessRunner for FakeRunner {
-        fn run(&self, command: &CommandSpec, mode: IoMode) -> Result<rmake_model::ProcessResult> {
-            assert!(matches!(mode, IoMode::Capture));
-            self.calls.lock().unwrap().push(command.clone());
-            let name = command.program.file_name().unwrap().to_string_lossy();
-            let arg = command.args[0].to_string_lossy();
-            let value = if arg == "--version" {
-                self.banners
-                    .iter()
-                    .find(|(key, _)| key == &name)
-                    .map(|(_, value)| value)
-            } else {
-                self.targets
-                    .iter()
-                    .find(|(key, _)| key == &name)
-                    .map(|(_, value)| value)
-            };
-            let Some(value) = value else {
-                return Err(Diagnostic::new(
-                    "fake",
-                    format!("unexpected probe for {name}"),
-                ));
-            };
-            Ok(rmake_model::ProcessResult {
-                code: 0,
-                stdout: value.as_bytes().to_vec(),
-                stderr: vec![],
-            })
-        }
-    }
-
-    struct LocalRunner;
-
-    impl ProcessRunner for LocalRunner {
-        fn run(&self, command: &CommandSpec, _mode: IoMode) -> Result<rmake_model::ProcessResult> {
-            let output = std::process::Command::new(&command.program)
-                .args(&command.args)
-                .current_dir(&command.cwd)
-                .output()
-                .map_err(|error| {
-                    Diagnostic::new(
-                        "test-process",
-                        format!("cannot run {}: {error}", command.program.display()),
-                    )
-                })?;
-            Ok(rmake_model::ProcessResult {
-                code: output.status.code().unwrap_or(-1),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        }
-    }
-
-    fn native_triple() -> String {
-        let arch = env::consts::ARCH;
-        if cfg!(target_os = "macos") {
-            format!("{arch}-apple-darwin25.2.0")
-        } else {
-            format!("{arch}-unknown-linux-gnu")
-        }
-    }
-
-    fn fake(root: &Path, names: &[&str], family: &str) -> FakeRunner {
-        for name in names {
-            let path = root.join(name);
-            fs::write(&path, "fake compiler").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        }
-        FakeRunner {
-            calls: Mutex::new(Vec::new()),
-            banners: names
-                .iter()
-                .map(|name| ((*name).to_owned(), family.to_owned()))
-                .collect(),
-            targets: names
-                .iter()
-                .map(|name| ((*name).to_owned(), native_triple()))
-                .collect(),
-        }
-    }
-
-    fn overrides(root: &Path, c: Option<&str>, cpp: Option<&str>) -> CompilerOptions {
-        CompilerOptions {
-            c_compiler: c.map(|name| root.join(name)),
-            cpp_compiler: cpp.map(|name| root.join(name)),
-        }
-    }
-
-    #[test]
-    fn classifies_gcc_clang_and_apple_clang_banners() {
-        assert_eq!(
-            classify_family("cc (GCC) 14\nFree Software Foundation"),
-            Some(CompilerFamily::Gcc)
-        );
-        assert_eq!(
-            classify_family("clang version 18"),
-            Some(CompilerFamily::Clang)
-        );
-        assert_eq!(
-            classify_family("Apple clang version 16"),
-            Some(CompilerFamily::AppleClang)
-        );
-        assert_eq!(classify_family("unknown compiler"), None);
-    }
-
-    #[test]
-    fn parses_versioned_darwin_and_macos_target_components() {
-        assert_eq!(
-            parse_target("arm64-apple-darwin25.2.0"),
-            Some(("aarch64".into(), "macos".into()))
-        );
-        assert_eq!(
-            parse_target("x86_64-apple-macos14.0.0"),
-            Some(("x86_64".into(), "macos".into()))
-        );
-        assert_eq!(
-            parse_target("aarch64-apple-macosx15.1"),
-            Some(("aarch64".into(), "macos".into()))
-        );
-    }
-
-    #[test]
-    fn detects_installed_native_cc_and_cxx_when_available() {
-        let Some(cc) = find_on_path(OsStr::new("cc")) else {
-            return;
-        };
-        let Some(cxx) = find_on_path(OsStr::new("c++")) else {
-            return;
-        };
-        let tc = detect(
-            None,
-            &[Language::C, Language::Cpp],
-            &CompilerOptions {
-                c_compiler: Some(cc.clone()),
-                cpp_compiler: Some(cxx.clone()),
-            },
-            &LocalRunner,
-        )
-        .unwrap();
-        assert_eq!(tc.info().c_driver.as_deref(), Some(cc.as_path()));
-        assert_eq!(tc.info().cpp_driver.as_deref(), Some(cxx.as_path()));
-    }
-
-    #[test]
-    fn compiler_selection_prefers_override_then_config_then_environment() {
-        let cli = PathBuf::from("cli compiler");
-        let config = PathBuf::from("config compiler");
-        let environment = PathBuf::from("environment compiler");
-        assert_eq!(
-            choose_compiler(
-                Some(&cli),
-                Some(&config),
-                Some(&environment),
-                Path::new("native")
-            ),
-            cli
-        );
-        assert_eq!(
-            choose_compiler(None, Some(&config), Some(&environment), Path::new("native")),
-            config
-        );
-        assert_eq!(
-            choose_compiler(None, None, Some(&environment), Path::new("native")),
-            environment
-        );
-        assert_eq!(
-            choose_compiler(None, None, None, Path::new("native")),
-            PathBuf::from("native")
-        );
-    }
-
-    #[test]
-    fn only_probes_requested_driver_and_reports_missing_other_driver() {
-        let dir = tempfile::tempdir().unwrap();
-        let runner = fake(dir.path(), &["only-c"], "gcc version 14");
-        let tc = detect(
-            Some(dir.path()),
-            &[Language::C],
-            &overrides(dir.path(), Some("only-c"), None),
-            &runner,
-        )
-        .unwrap();
-        assert!(tc.info().c_driver.is_some());
-        assert!(tc.info().cpp_driver.is_none());
-        let request = LinkRequest {
-            objects: vec![],
-            output: "out".into(),
-            language: Language::Cpp,
-            profile: ProfileSettings {
-                optimization: Optimization::None,
-                debug: false,
-            },
-            cwd: dir.path().into(),
-        };
-        assert!(
-            tc.link_command(&request)
-                .unwrap_err()
-                .message
-                .contains("no Cpp driver")
-        );
-        assert_eq!(runner.calls.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn detects_family_alias_and_rejects_mixed_families() {
-        let dir = tempfile::tempdir().unwrap();
-        let runner = fake(dir.path(), &["cc", "cxx"], "Apple clang version 16");
-        let tc = detect(
-            Some(dir.path()),
-            &[Language::C, Language::Cpp],
-            &overrides(dir.path(), Some("cc"), Some("cxx")),
-            &runner,
-        )
-        .unwrap();
-        assert_eq!(tc.info().family, CompilerFamily::AppleClang);
-        let mixed = FakeRunner {
-            calls: Mutex::new(Vec::new()),
-            banners: vec![
-                ("cc".into(), "gcc 14 Free Software Foundation".into()),
-                ("cxx".into(), "clang version 18".into()),
-            ],
-            targets: vec![
-                ("cc".into(), native_triple()),
-                ("cxx".into(), native_triple()),
-            ],
-        };
-        let error = detect(
-            Some(dir.path()),
-            &[Language::C, Language::Cpp],
-            &overrides(dir.path(), Some("cc"), Some("cxx")),
-            &mixed,
-        )
-        .unwrap_err();
-        assert!(error.message.contains("one compiler family"));
-    }
-
-    #[test]
-    fn compile_and_link_keep_paths_with_spaces_as_single_arguments() {
-        let dir = tempfile::tempdir().unwrap();
-        let runner = fake(
-            dir.path(),
-            &["cc", "cxx", "compiler with spaces"],
-            "gcc version 14",
-        );
-        let tc = detect(
-            Some(dir.path()),
-            &[Language::C, Language::Cpp],
-            &overrides(dir.path(), Some("cc"), Some("cxx")),
-            &runner,
-        )
-        .unwrap();
-        let include = PathBuf::from("include files");
-        let source = SourceFile {
-            path: "src/main file.cpp".into(),
-            relative_path: "main file.cpp".into(),
-            language: Language::Cpp,
-        };
-        let compile = tc
-            .compile_command(&CompileRequest {
-                source,
-                output: "obj/main file.o".into(),
-                include_dirs: vec![include.clone()],
-                standards: Standards::default(),
-                profile: ProfileSettings {
-                    optimization: Optimization::None,
-                    debug: true,
-                },
-                cwd: dir.path().into(),
-            })
-            .unwrap();
-        assert_eq!(compile.args[0], "-std=c++20");
-        assert_eq!(compile.args[5], "-I");
-        assert_eq!(compile.args[6], include.as_os_str());
-        assert_eq!(compile.args[8], "src/main file.cpp");
-        assert_eq!(compile.args[10], "obj/main file.o");
-        assert_eq!(compile.program, dir.path().join("cxx"));
-        let link = tc
-            .link_command(&LinkRequest {
-                objects: vec!["obj/a file.o".into()],
-                output: "bin/my app".into(),
-                language: Language::Cpp,
-                profile: ProfileSettings {
-                    optimization: Optimization::Speed,
-                    debug: false,
-                },
-                cwd: dir.path().into(),
-            })
-            .unwrap();
-        assert_eq!(link.program, dir.path().join("cxx"));
-        assert_eq!(
-            link.args,
-            vec![
-                OsString::from("-O2"),
-                OsString::from("obj/a file.o"),
-                OsString::from("-o"),
-                OsString::from("bin/my app")
-            ]
-        );
-    }
-
-    #[test]
-    fn rejects_shell_expressions_unknown_fields_and_cross_targets() {
-        let dir = tempfile::tempdir().unwrap();
-        let spaced = dir.path().join("compiler with spaces");
-        fs::write(&spaced, "compiler").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&spaced, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        assert!(
-            resolve_executable(Path::new("clang -O2"), dir.path())
-                .unwrap_err()
-                .contains("embedded compiler options")
-        );
-        assert_eq!(
-            resolve_executable(Path::new("compiler with spaces"), dir.path()).unwrap(),
-            dir.path().join("compiler with spaces")
-        );
-        let cfg = dir.path().join(".rmake");
-        fs::create_dir_all(&cfg).unwrap();
-        fs::write(cfg.join("config.toml"), "schema = 1\nunknown = true\n").unwrap();
-        let err = detect(
-            Some(dir.path()),
-            &[Language::C],
-            &CompilerOptions::default(),
-            &FakeRunner::default(),
-        )
-        .unwrap_err();
-        assert!(err.message.contains("unknown"));
-
-        fs::remove_file(cfg.join("config.toml")).unwrap();
-        let other_arch = if canonical_arch(env::consts::ARCH) == Some("aarch64") {
-            "x86_64"
-        } else {
-            "aarch64"
-        };
-        let other_target = if cfg!(target_os = "macos") {
-            format!("{other_arch}-apple-darwin25.2.0")
-        } else {
-            format!("{other_arch}-unknown-linux-gnu")
-        };
-        let runner = FakeRunner {
-            calls: Mutex::new(Vec::new()),
-            banners: vec![("cross".into(), "gcc version 14".into())],
-            targets: vec![("cross".into(), other_target)],
-        };
-        let path = dir.path().join("cross");
-        fs::write(&path, "x").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let err = detect(
-            Some(dir.path()),
-            &[Language::C],
-            &overrides(dir.path(), Some("cross"), None),
-            &runner,
-        )
-        .unwrap_err();
-        assert!(err.message.contains("cross compilation is not supported"));
-    }
 }

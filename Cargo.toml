@@ -18,6 +18,9 @@ walkdir = "2.5.0"
 globset = "0.4.20"
 thiserror = "2.0.21"
 tempfile = "3.27.0"
+blake3 = "1.8.7"
+nix = { version = "0.31.3", features = ["signal", "process"] }
+ctrlc = "3.5.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

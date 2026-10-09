@@ -1,125 +1,188 @@
-//! Sequential full builds with publication only after successful native linking.
-use std::fs;
-use std::path::Path;
-
-use crate::{plan, storage};
+//! Action execution and atomic publication inside verified RMake-owned storage.
+use crate::{depfile, fingerprint, plan, scheduler, state::ActionState, storage};
 use rmake_model::{
-    BuildReporter, BuildResult, CommandSpec, Diagnostic, Discovery, IoMode, ProcessRunner,
-    ProfileKind, Project, Result, Toolchain,
+    ActionKind, Archiver, BuildAction, BuildOptions, BuildReporter, BuildResult, Diagnostic,
+    Discovery, IoMode, ProcessRunner, Project, Result, Toolchain,
 };
+use std::{fs, path::Path};
 
-fn ensure_directory(path: &Path) -> Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && (!metadata.is_dir() || metadata.file_type().is_symlink())
-    {
+pub(crate) fn ensure_directory(path: &Path, owned: &Path) -> Result<()> {
+    if !path.starts_with(owned) {
         return Err(Diagnostic::new(
             "RMAKE-O102",
-            format!("output path must be a real directory: {}", path.display()),
+            "output escaped owned directory",
         ));
     }
-    fs::create_dir_all(path).map_err(|error| {
-        Diagnostic::new("RMAKE-O101", format!("create {}: {error}", path.display()))
-    })
+    let mut current = owned.to_path_buf();
+    for part in path
+        .strip_prefix(owned)
+        .expect("checked prefix")
+        .components()
+    {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(m) if !m.is_dir() || m.file_type().is_symlink() => {
+                return Err(Diagnostic::new(
+                    "RMAKE-O102",
+                    format!(
+                        "output directory is not a real directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(e) = fs::create_dir(&current)
+                    && e.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(Diagnostic::new("RMAKE-O101", e.to_string()));
+                }
+                let m = fs::symlink_metadata(&current)
+                    .map_err(|e| Diagnostic::new("RMAKE-O101", e.to_string()))?;
+                if !m.is_dir() || m.file_type().is_symlink() {
+                    return Err(Diagnostic::new(
+                        "RMAKE-O102",
+                        "output directory changed during creation",
+                    ));
+                }
+            }
+            Err(e) => return Err(Diagnostic::new("RMAKE-O101", e.to_string())),
+        }
+    }
+    Ok(())
 }
-
-fn execute(
-    command: &CommandSpec,
-    runner: &dyn ProcessRunner,
-    reporter: &dyn BuildReporter,
-    failure_code: &'static str,
-) -> Result<()> {
-    reporter.started(command);
-    let result = runner.run(command, IoMode::Capture)?;
-    reporter.output(&result)?;
-    if result.code != 0 {
+fn regular_output(path: &Path) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
         return Err(Diagnostic::new(
-            failure_code,
-            format!(
-                "{} failed with exit status {}; executable was not published",
-                command.label, result.code
-            ),
+            "RMAKE-O102",
+            format!("output must be a regular file: {}", path.display()),
         ));
     }
     Ok(())
 }
-
+pub(crate) fn perform(
+    action: &BuildAction,
+    owned: &Path,
+    runner: &dyn ProcessRunner,
+    options: &BuildOptions,
+    reporter: &dyn BuildReporter,
+) -> Result<()> {
+    options.cancellation.check()?;
+    ensure_directory(action.output.parent().expect("output parent"), owned)?;
+    regular_output(&action.output)?;
+    let temp = tempfile::Builder::new()
+        .prefix(".action-")
+        .tempdir_in(owned)
+        .map_err(|e| Diagnostic::new("RMAKE-O101", e.to_string()))?;
+    let staged = temp.path().join("output");
+    let staged_dep = temp.path().join("dependencies.d");
+    let mut command = action.command.clone();
+    for arg in &mut command.args {
+        if arg == action.output.as_os_str() {
+            *arg = staged.clone().into_os_string();
+        }
+        if let ActionKind::Compile { depfile, .. } = &action.kind
+            && arg == depfile.as_os_str()
+        {
+            *arg = staged_dep.clone().into_os_string();
+        }
+    }
+    let inputs = fingerprint::observed_inputs(action);
+    let before = fingerprint::input_snapshot(&inputs)?;
+    reporter.started(&command);
+    let result = runner.run_cancelled(&command, IoMode::Capture, &options.cancellation)?;
+    reporter.output(&result)?;
+    options.cancellation.check()?;
+    if result.code != 0 {
+        return Err(Diagnostic::new(
+            "RMAKE-B101",
+            format!("{} failed with status {}", command.label, result.code),
+        ));
+    }
+    if before != fingerprint::input_snapshot(&inputs)? {
+        return Err(Diagnostic::new(
+            "RMAKE-B103",
+            "an input changed during the native action; retry the build",
+        ));
+    }
+    if !fs::symlink_metadata(&staged)
+        .is_ok_and(|m| m.is_file() && m.len() > 0 && !m.file_type().is_symlink())
+    {
+        return Err(Diagnostic::new(
+            "RMAKE-B102",
+            format!("{} produced no regular output", command.label),
+        ));
+    }
+    if let ActionKind::Compile { depfile, .. } = &action.kind {
+        ensure_directory(depfile.parent().expect("depfile parent"), owned)?;
+        regular_output(depfile)?;
+        if !staged_dep.is_file() {
+            return Err(Diagnostic::new(
+                "RMAKE-B102",
+                "compiler produced no dependency file",
+            ));
+        }
+        depfile::parse_depfile(
+            &fs::read(&staged_dep).map_err(|e| Diagnostic::new("RMAKE-O101", e.to_string()))?,
+            &command.cwd,
+        )?;
+        fs::rename(&staged_dep, depfile)
+            .map_err(|e| Diagnostic::new("RMAKE-O101", e.to_string()))?;
+    }
+    fs::rename(staged, &action.output).map_err(|e| Diagnostic::new("RMAKE-O101", e.to_string()))?;
+    Ok(())
+}
 pub fn build(
     project: &Project,
     discovery: &Discovery,
     toolchain: &dyn Toolchain,
+    archiver: &dyn Archiver,
     runner: &dyn ProcessRunner,
-    profile: ProfileKind,
+    options: &BuildOptions,
     reporter: &dyn BuildReporter,
 ) -> Result<BuildResult> {
     let _lock = storage::lock(&project.root)?;
-    let output = storage::prepare_owned(&project.root)?;
-    let staging = tempfile::Builder::new()
-        .prefix(".work-")
-        .tempdir_in(&output)
-        .map_err(|error| {
-            Diagnostic::new(
-                "RMAKE-O101",
-                format!("create build staging directory: {error}"),
-            )
-        })?;
-    let artifacts = output.join("artifacts");
-    ensure_directory(&artifacts)?;
-    let profile_dir = artifacts.join(profile.name());
-    ensure_directory(&profile_dir)?;
-    let final_executable = profile_dir.join(&project.target.name);
-    if fs::symlink_metadata(&final_executable)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        return Err(Diagnostic::new(
-            "RMAKE-O102",
-            format!(
-                "executable output is not a regular file: {}",
-                final_executable.display()
-            ),
-        ));
-    }
-    let plan = plan::plan(
-        project,
-        discovery,
-        toolchain,
-        profile,
-        staging.path(),
-        &final_executable,
-    )?;
-    for action in &plan.compiles {
-        let parent = action.output.parent().expect("planned object has a parent");
-        fs::create_dir_all(parent).map_err(|error| {
-            Diagnostic::new(
-                "RMAKE-O101",
-                format!("create object directory {}: {error}", parent.display()),
-            )
-        })?;
-        execute(&action.command, runner, reporter, "RMAKE-C101")?;
-        if !action.output.is_file() {
-            return Err(Diagnostic::new(
-                "RMAKE-C102",
-                format!(
-                    "compiler reported success without producing {}",
-                    action.output.display()
-                ),
-            ));
+    let owned = storage::prepare_owned(&project.root)?;
+    let plan = plan::plan(project, discovery, toolchain, archiver, options, &owned)?;
+    let identity = format!(
+        "rmake-m1-action-v1\n{:?}\n{}\n{}",
+        toolchain.info().family,
+        toolchain.info().target,
+        toolchain.info().version
+    );
+    let mut identity = identity.into_bytes();
+    identity.extend(archiver.identity());
+    let state = ActionState::new(&project.root, &owned, &identity)?;
+    let completed = scheduler::run(&plan, options.jobs, &options.cancellation, &|action| {
+        if !options.rebuild && action.cacheable && state.is_fresh(action)? {
+            return Ok(true);
+        }
+        state.invalidate(action)?;
+        perform(action, &owned, runner, options, reporter)?;
+        state.record(action)?;
+        Ok(false)
+    });
+    options.cancellation.check()?;
+    let completed = completed?;
+    let mut result = BuildResult {
+        artifacts: plan.artifacts.clone(),
+        ..BuildResult::default()
+    };
+    for (id, reused) in completed {
+        if reused {
+            result.reused += 1;
+            continue;
+        }
+        let action = plan
+            .actions
+            .iter()
+            .find(|a| a.id == id)
+            .expect("completed planned action");
+        match action.kind {
+            ActionKind::Compile { .. } => result.compiled += 1,
+            ActionKind::Archive => result.archived += 1,
+            ActionKind::Link => result.linked += 1,
         }
     }
-    execute(&plan.link, runner, reporter, "RMAKE-L101")?;
-    if !plan.staged_executable.is_file() {
-        return Err(Diagnostic::new(
-            "RMAKE-L102",
-            "linker reported success without producing an executable",
-        ));
-    }
-    fs::rename(&plan.staged_executable, &plan.final_executable).map_err(|error| {
-        Diagnostic::new(
-            "RMAKE-O101",
-            format!("publish {}: {error}", plan.final_executable.display()),
-        )
-    })?;
-    Ok(BuildResult {
-        executable: plan.final_executable,
-        compiled: plan.compiles.len(),
-    })
+    Ok(result)
 }
