@@ -1,0 +1,17 @@
+# Keep only the files needed to build/run RMake and its usage guide.
+# All other files stay local.
+/*
+!/.gitignore
+!/README.md
+!/Cargo.toml
+!/Cargo.lock
+!/rust-toolchain.toml
+
+# Keep crate manifests and Rust implementation sources.
+!/crates/
+/crates/**
+!/crates/*/
+!/crates/*/Cargo.toml
+!/crates/*/src/
+!/crates/*/src/**/
+!/crates/*/src/**/*.rs

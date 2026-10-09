@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/rmake-model", "crates/rmake-core", "crates/rmake-toolchains", "crates/rmake-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[workspace.dependencies]
+rmake-model = { path = "crates/rmake-model" }
+rmake-core = { path = "crates/rmake-core" }
+rmake-toolchains = { path = "crates/rmake-toolchains" }
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+walkdir = "2.5.0"
+globset = "0.4.20"
+thiserror = "2.0.21"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
