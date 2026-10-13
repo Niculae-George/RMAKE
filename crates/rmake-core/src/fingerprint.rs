@@ -401,16 +401,18 @@ fn hash_membership(
             || canonical_owned
                 .as_ref()
                 .is_some_and(|owned| canonical.starts_with(owned))
-            || sdk_roots
-                .iter()
-                .any(|sdk| directory.starts_with(sdk) || canonical.starts_with(sdk))
-            || is_sdk_path(&canonical)
         {
             continue;
         }
         if canonical.starts_with(&project_root) {
             local_roots.insert(canonical);
-        } else if include_directories.contains(&directory) && !is_system_path(&canonical) {
+        } else if !sdk_roots
+            .iter()
+            .any(|sdk| directory.starts_with(sdk) || canonical.starts_with(sdk))
+            && !is_sdk_path(&canonical)
+            && include_directories.contains(&directory)
+            && !is_system_path(&canonical)
+        {
             snapshot_external_directory(&mut snapshot, &canonical)?;
         }
     }

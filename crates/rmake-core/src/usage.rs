@@ -210,7 +210,7 @@ fn merge_standard(
         }
     }
 }
-fn standard_rank(value: &str, cpp: bool) -> Option<u8> {
+pub(crate) fn standard_rank(value: &str, cpp: bool) -> Option<u8> {
     if cpp {
         match value {
             "c++11" => Some(1),

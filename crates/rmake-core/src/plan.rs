@@ -8,7 +8,7 @@ use std::{
 use rmake_model::{
     ActionKind, ArchiveRequest, Archiver, BuildAction, BuildOptions, BuildPlan, CompileRequest,
     Diagnostic, Discovery, Language, LinkRequest, Project, Result, Standards, TargetKind,
-    Toolchain, UsageRequirements,
+    TargetOrigin, Toolchain, UsageRequirements,
 };
 
 use crate::usage::{compile_usage, link_closure};
@@ -31,7 +31,9 @@ pub fn plan(
 
     for target_name in &target_order {
         let target = project.target(target_name)?;
-        if target.kind == TargetKind::HeaderOnly {
+        if target.kind == TargetKind::HeaderOnly
+            || matches!(target.origin, TargetOrigin::StaticFolder { .. })
+        {
             continue;
         }
         let sources = discovery.sources.get(target_name).ok_or_else(|| {
@@ -141,7 +143,11 @@ pub fn plan(
                 let mut inputs = target_objects;
                 let mut prerequisites = target_compile_ids;
                 for dependency in &linked_archives {
-                    if let Some(path) = plan.artifacts.get(*dependency) {
+                    if let TargetOrigin::StaticFolder { library, .. } =
+                        &project.target(dependency)?.origin
+                    {
+                        inputs.push(library.clone());
+                    } else if let Some(path) = plan.artifacts.get(*dependency) {
                         inputs.push(path.clone());
                     } else {
                         let path = archive_path(output, profile, dependency);
@@ -151,7 +157,7 @@ pub fn plan(
                         prerequisites.push(id.clone());
                     }
                 }
-                let language = if target_order_has_cpp(discovery, target_name, &closure) {
+                let language = if target_order_has_cpp(project, discovery, target_name, &closure) {
                     Language::Cpp
                 } else {
                     Language::C
@@ -196,10 +202,11 @@ fn selected_roots(project: &Project, options: &BuildOptions) -> Result<Vec<Strin
                 .targets
                 .iter()
                 .filter(|target| {
-                    matches!(
-                        target.kind,
-                        TargetKind::Bin | TargetKind::Static | TargetKind::HeaderOnly
-                    )
+                    target.is_local()
+                        && matches!(
+                            target.kind,
+                            TargetKind::Bin | TargetKind::Static | TargetKind::HeaderOnly
+                        )
                 })
                 .map(|target| target.name.clone()),
         );
@@ -262,27 +269,63 @@ fn dependency_first_order(project: &Project, roots: &[String]) -> Result<Vec<Str
 
 fn resolved_standards(defaults: &Standards, usage: &UsageRequirements) -> Standards {
     Standards {
-        c: usage
-            .c_standard
-            .clone()
-            .unwrap_or_else(|| defaults.c.clone()),
-        cpp: usage
-            .cpp_standard
-            .clone()
-            .unwrap_or_else(|| defaults.cpp.clone()),
+        c: resolved_standard(&defaults.c, usage.c_standard.as_deref(), false),
+        cpp: resolved_standard(&defaults.cpp, usage.cpp_standard.as_deref(), true),
     }
 }
 
-fn target_order_has_cpp(discovery: &Discovery, target: &str, closure: &[String]) -> bool {
+fn resolved_standard(default: &str, minimum: Option<&str>, cpp: bool) -> String {
+    minimum
+        .filter(|required| {
+            crate::usage::standard_rank(required, cpp) > crate::usage::standard_rank(default, cpp)
+        })
+        .unwrap_or(default)
+        .to_owned()
+}
+
+fn target_order_has_cpp(
+    project: &Project,
+    discovery: &Discovery,
+    target: &str,
+    closure: &[String],
+) -> bool {
     std::iter::once(target)
         .chain(closure.iter().map(String::as_str))
         .any(|name| {
-            discovery.sources.get(name).is_some_and(|sources| {
+            project.target(name).is_ok_and(|target| {
+                matches!(
+                    target.origin,
+                    TargetOrigin::StaticFolder {
+                        language: Language::Cpp,
+                        ..
+                    }
+                )
+            }) || discovery.sources.get(name).is_some_and(|sources| {
                 sources
                     .iter()
                     .any(|source| source.language == Language::Cpp)
             })
         })
+}
+
+/// Drivers needed for selected compilation and actual executable link closures.
+pub fn required_languages(project: &Project, discovery: &Discovery) -> Result<Vec<Language>> {
+    let mut languages: BTreeSet<_> = discovery
+        .sources
+        .values()
+        .flatten()
+        .map(|s| s.language)
+        .collect();
+    for name in discovery.sources.keys() {
+        let target = project.target(name)?;
+        if target.is_local() && target.kind.is_executable() {
+            let closure = link_closure(project, name)?;
+            if target_order_has_cpp(project, discovery, name, &closure) {
+                languages.insert(Language::Cpp);
+            }
+        }
+    }
+    Ok(languages.into_iter().collect())
 }
 
 fn archive_path(output: &Path, profile: &str, target: &str) -> PathBuf {

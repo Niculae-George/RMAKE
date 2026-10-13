@@ -7,6 +7,7 @@ use std::{
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use rmake_model::{
     Diagnostic, Discovery, IgnoredFile, Language, Project, Result, SourceFile, Target, TargetKind,
+    TargetOrigin,
 };
 use walkdir::{DirEntry, WalkDir};
 
@@ -38,14 +39,23 @@ pub fn discover_selected(project: &Project, names: &[String]) -> Result<Discover
     let roots: Vec<(String, PathBuf, TargetKind)> = project
         .targets
         .iter()
-        .filter_map(|t| t.root.as_ref().map(|r| (t.name.clone(), r.clone(), t.kind)))
+        .filter_map(|t| {
+            let root = match &t.origin {
+                TargetOrigin::HeaderFolder { root, .. }
+                | TargetOrigin::StaticFolder { root, .. } => Some(root),
+                TargetOrigin::Local => t.root.as_ref(),
+            };
+            root.map(|r| (t.name.clone(), r.clone(), t.kind))
+        })
         .collect();
     for target in project
         .targets
         .iter()
         .filter(|t| selected.contains(&t.name))
     {
-        if target.kind == TargetKind::HeaderOnly {
+        if target.kind == TargetKind::HeaderOnly
+            || matches!(target.origin, TargetOrigin::StaticFolder { .. })
+        {
             result.sources.insert(target.name.clone(), Vec::new());
             continue;
         }

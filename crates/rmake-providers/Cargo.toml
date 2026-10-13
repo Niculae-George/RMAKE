@@ -1,0 +1,12 @@
+[package]
+name = "rmake-providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmake-model.workspace = true
+object.workspace = true
+
+[lints]
+workspace = true

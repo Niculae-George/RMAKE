@@ -149,6 +149,67 @@ examples = false
 
 Exclusions are package-relative. Hidden/reserved directories and nested packages are excluded from source scans; directory symlinks are skipped and source symlinks rejected. Roots must be unambiguous; target names must be unique, including differences in letter case. With several libraries, declare auxiliary targets and their dependencies explicitly.
 
+## Header-only libraries from folders
+
+Download a header-only library into your project, then declare its folder:
+
+```toml
+[dependencies]
+math = { provider = "folder", kind = "header-only", root = "third_party/math" }
+```
+
+RMake uses `third_party/math/include/` if present, otherwise the folder itself. Your code can include its headers normally. An inferred application, library, test, or example privately consumes declared dependencies automatically.
+
+Explicit targets select their dependencies:
+
+```toml
+[targets.dependencies]
+math = "private"
+```
+
+Use `public` when a local library exposes the dependency in its public headers, or `interface` for consumer-only requirements. `target:math` identifies a same-project target; `math` identifies the declared folder dependency.
+
+Optional folder settings:
+
+```toml
+[dependencies.geometry]
+provider = "folder"
+kind = "header-only"
+root = "third_party/geometry"
+includes = ["headers"]
+cpp-standard = "c++20"
+defines = { GEOMETRY_HEADER_ONLY = "1" }
+```
+
+`includes` paths are relative to that folder and replace the default. Required standards can raise the package standard; they never lower it. `rmake inspect files` shows resolved include paths. Header edits and new shadowing headers invalidate affected compilation.
+
+This first M2 iteration supports folders inside the package, outside RMake-owned `build/rmake/` outputs. RMake reads them without downloading, modifying, or compiling their source files. Downloaded source-library builds and folders outside the package come in later iterations. Prebuilt archives are supported separately below.
+
+## Prebuilt static libraries
+
+Place the archive and optional headers in a folder inside your package:
+
+```toml
+[dependencies.graphics]
+provider = "folder"
+kind = "static"
+root = "third_party/graphics"
+library = "lib/libgraphics.a"
+includes = ["include"]
+language = "cpp"
+compatibility = "user-asserted"
+```
+
+Inferred compiled targets consume declared dependencies privately. Explicit targets select the alias through `[targets.dependencies]`, using the same private/public/interface rules as header-only folders.
+
+`library` names one archive relative to its folder. RMake links it directly and never recompiles, recreates, copies, or modifies it. Replacing its contents triggers relinking; unchanged application sources can reuse their objects. `--rebuild` still leaves imported archives untouched. Development and release use the same declared archive.
+
+`language = "c"` permits C-only linking. Omitted language conservatively defaults to `cpp`, requiring the C++ link driver even for a C application. Include paths, definitions and minimum standards work as for header-only imports; static imports may use `includes = []` when they export no headers.
+
+`compatibility = "user-asserted"` is required in this iteration: you assert that the archive matches your compiler ABI, standard library and runtime. RMake checks every object member for native binary format, CPU architecture, pointer width, byte order and observable platform markers; these checks do not fully verify ABI compatibility. `rmake inspect files` displays that distinction.
+
+Supported archives contain ordinary native ELF objects on Linux or Mach-O objects on macOS. Empty, malformed, foreign, thin, universal/fat and LLVM bitcode archives are rejected. Archive paths must remain within the declared folder, outside RMake-owned outputs; symlink archive paths are rejected. Automatic archive selection and debug/release variant selection are not implemented.
+
 ## Configure tools
 
 ```sh
@@ -189,6 +250,6 @@ cpp-standard = "c++23"
 
 ## Current limits
 
-M1 supports native, single-package applications and static/header-only libraries on Linux and macOS. External libraries—including manually downloaded folders—workspaces, shared libraries, generators, Windows, and cross-compilation are deferred.
+RMake supports native, single-package applications and static/header-only libraries on Linux and macOS. M2.1–M2.2 add package-local header-only folders and explicit prebuilt static archives. Downloaded source-library builds, transitive import descriptors, system-library discovery, package managers, workspaces, shared libraries, generators, Windows, and cross-compilation are deferred.
 
 Builds track consumed system headers and SDK identity; they do not scan every SDK tree or provide hermetic builds. Project include-directory changes can conservatively rebuild more than one source. Tests have no built-in timeout or test framework.

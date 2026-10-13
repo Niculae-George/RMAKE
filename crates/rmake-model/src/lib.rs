@@ -2,7 +2,7 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -135,9 +135,94 @@ pub struct UsageRequirements {
     pub c_standard: Option<String>,
     pub cpp_standard: Option<String>,
 }
+/// Origin keeps imported dependencies distinct from user-selectable production targets.
+#[derive(Clone, Debug)]
+pub enum TargetOrigin {
+    Local,
+    HeaderFolder {
+        alias: String,
+        root: PathBuf,
+        default_includes: bool,
+    },
+    StaticFolder {
+        alias: String,
+        root: PathBuf,
+        default_includes: bool,
+        library: PathBuf,
+        language: Language,
+        compatibility: StaticCompatibility,
+        evidence: ArchiveEvidence,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct HeaderFolderRequest {
+    pub alias: String,
+    pub root: PathBuf,
+    pub includes: Option<Vec<PathBuf>>,
+    pub definitions: BTreeMap<String, String>,
+    pub c_standard: Option<String>,
+    pub cpp_standard: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct HeaderFolderImport {
+    pub alias: String,
+    pub root: PathBuf,
+    pub usage: UsageRequirements,
+    pub default_includes: bool,
+}
+/// Read-only folder metadata resolution; native compilation stays in core.
+pub trait HeaderFolderResolver: Send + Sync {
+    fn resolve(
+        &self,
+        package_root: &Path,
+        request: &HeaderFolderRequest,
+    ) -> Result<HeaderFolderImport>;
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticCompatibility {
+    UserAsserted,
+}
+#[derive(Clone, Debug)]
+pub struct ArchiveEvidence {
+    pub format: String,
+    pub architecture: String,
+    pub members: usize,
+}
+#[derive(Clone, Debug)]
+pub struct StaticFolderRequest {
+    pub headers: HeaderFolderRequest,
+    pub library: PathBuf,
+    pub language: Language,
+    pub compatibility: StaticCompatibility,
+}
+#[derive(Clone, Debug)]
+pub struct StaticFolderImport {
+    pub headers: HeaderFolderImport,
+    pub library: PathBuf,
+    pub language: Language,
+    pub compatibility: StaticCompatibility,
+    pub evidence: ArchiveEvidence,
+}
+pub trait StaticFolderResolver: Send + Sync {
+    fn resolve_static(
+        &self,
+        package_root: &Path,
+        request: &StaticFolderRequest,
+    ) -> Result<StaticFolderImport>;
+}
+/// Composition of the supported, focused folder-provider capabilities.
+pub trait FolderResolver: HeaderFolderResolver + StaticFolderResolver {}
+impl<T: HeaderFolderResolver + StaticFolderResolver> FolderResolver for T {}
+
+pub fn folder_target_name(alias: &str) -> String {
+    format!("@folder:{alias}")
+}
+
 #[derive(Clone, Debug)]
 pub struct Target {
     pub name: String,
+    pub origin: TargetOrigin,
     pub kind: TargetKind,
     pub root: Option<PathBuf>,
     pub include_dirs: Vec<PathBuf>,
@@ -148,6 +233,11 @@ pub struct Target {
     pub dependencies: Vec<TargetDependency>,
     pub compile_options: Vec<OsString>,
     pub link_options: Vec<OsString>,
+}
+impl Target {
+    pub fn is_local(&self) -> bool {
+        matches!(self.origin, TargetOrigin::Local)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Project {

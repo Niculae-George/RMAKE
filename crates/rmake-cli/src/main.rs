@@ -220,9 +220,10 @@ fn dispatch(command: Command, cancellation: &Cancellation) -> rmake_model::Resul
         Command::Run(args) => run_command(args, cancellation),
         Command::Test(args) => test_command(args, cancellation),
         Command::Clean => {
-            let project = load_current_project()?;
-            storage::clean(&project.root)?;
-            println!("cleaned {}", project.root.display());
+            let path = manifest::find_manifest(&current_dir()?)?;
+            let root = path.parent().expect("manifest parent");
+            storage::clean(root)?;
+            println!("cleaned {}", root.display());
             Ok(0)
         }
         Command::Doctor(args) => doctor(args),
@@ -281,7 +282,7 @@ fn build_command(args: BuildArgs, cancellation: &Cancellation) -> rmake_model::R
         project
             .targets
             .iter()
-            .filter(|target| is_production(target.kind))
+            .filter(|target| target.is_local() && is_production(target.kind))
             .map(|target| target.name.clone())
             .collect::<Vec<_>>()
     } else {
@@ -416,7 +417,7 @@ fn build_selected(
     if !has_compiled_sources {
         return Ok(BuildResult::default());
     }
-    let languages = unique_languages(&discovered.sources);
+    let languages = rmake_core::plan::required_languages(project, discovered)?;
     let toolchain = detect(
         Some(&project.root),
         &languages,
@@ -532,7 +533,7 @@ fn select_run_target<'a>(
 fn load_current_project() -> rmake_model::Result<Project> {
     let cwd = current_dir()?;
     let manifest_path = manifest::find_manifest(&cwd)?;
-    manifest::load_project(&manifest_path)
+    manifest::load_project_with_imports(&manifest_path, &rmake_providers::LocalFolderProvider)
 }
 
 struct TerminalReporter {
@@ -565,26 +566,17 @@ fn current_dir() -> rmake_model::Result<PathBuf> {
     })
 }
 
-fn unique_languages(
-    sources: &std::collections::BTreeMap<String, Vec<rmake_model::SourceFile>>,
-) -> Vec<Language> {
-    let mut languages = Vec::new();
-    for source in sources.values().flatten() {
-        if !languages.contains(&source.language) {
-            languages.push(source.language);
-        }
-    }
-    languages.sort();
-    languages
-}
-
 fn doctor(args: CompilerArgs) -> rmake_model::Result<i32> {
     let cwd = current_dir()?;
     let (root, languages) = match manifest::find_manifest(&cwd) {
         Ok(path) => {
-            let project = manifest::load_project(&path)?;
+            let project =
+                manifest::load_project_with_imports(&path, &rmake_providers::LocalFolderProvider)?;
             let discovery = discovery::discover(&project)?;
-            (project.root, unique_languages(&discovery.sources))
+            (
+                project.root.clone(),
+                rmake_core::plan::required_languages(&project, &discovery)?,
+            )
         }
         Err(error) if error.code == "manifest-not-found" => (cwd, vec![Language::C, Language::Cpp]),
         Err(error) => return Err(error),
@@ -630,6 +622,51 @@ fn inspect_files() -> rmake_model::Result<i32> {
                 language_name(source.language),
                 target
             );
+        }
+    }
+    for target in &project.targets {
+        if let rmake_model::TargetOrigin::HeaderFolder {
+            alias,
+            root,
+            default_includes,
+        } = &target.origin
+        {
+            println!(
+                "dependency {alias} (header-only folder): {}",
+                root.display()
+            );
+            for include in &target.interface.include_dirs {
+                let suffix = if *default_includes { " (default)" } else { "" };
+                println!("  include: {}{suffix}", include.display());
+            }
+        }
+    }
+    for target in &project.targets {
+        if let rmake_model::TargetOrigin::StaticFolder {
+            alias,
+            root,
+            library,
+            language,
+            evidence,
+            ..
+        } = &target.origin
+        {
+            println!(
+                "dependency {alias} (prebuilt static folder): {}",
+                root.display()
+            );
+            println!("  archive: {}", library.display());
+            println!(
+                "  language/runtime: {:?}; compatibility: user-asserted",
+                language
+            );
+            println!(
+                "  observed: {} / {}, {} object member(s)",
+                evidence.format, evidence.architecture, evidence.members
+            );
+            for include in &target.interface.include_dirs {
+                println!("  include: {}", include.display());
+            }
         }
     }
     println!("ignored:");

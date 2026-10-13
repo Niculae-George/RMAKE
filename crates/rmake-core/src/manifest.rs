@@ -6,8 +6,10 @@ use std::{
 };
 
 use rmake_model::{
-    Diagnostic, Optimization, ProfileSettings, Profiles, Project, Result, Standards, Target,
-    TargetDependency, TargetKind, UsageRequirements, Visibility,
+    Diagnostic, FolderResolver, HeaderFolderImport, HeaderFolderRequest, HeaderFolderResolver,
+    Language, Optimization, ProfileSettings, Profiles, Project, Result, Standards,
+    StaticCompatibility, StaticFolderImport, StaticFolderRequest, StaticFolderResolver, Target,
+    TargetDependency, TargetKind, TargetOrigin, UsageRequirements, Visibility, folder_target_name,
 };
 use serde::Deserialize;
 
@@ -26,6 +28,24 @@ struct RawManifest {
     discovery: RawDiscovery,
     #[serde(default)]
     targets: Vec<RawTarget>,
+    #[serde(default)]
+    dependencies: BTreeMap<String, RawFolderDependency>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawFolderDependency {
+    provider: String,
+    kind: String,
+    root: String,
+    #[serde(default)]
+    includes: Option<Vec<String>>,
+    #[serde(default)]
+    defines: BTreeMap<String, String>,
+    c_standard: Option<String>,
+    cpp_standard: Option<String>,
+    library: Option<String>,
+    language: Option<String>,
+    compatibility: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -129,6 +149,12 @@ pub fn find_manifest(start: &Path) -> Result<PathBuf> {
     }
 }
 pub fn load_project(manifest: &Path) -> Result<Project> {
+    load_project_with_folders(manifest, &RejectFolderResolver)
+}
+pub fn load_project_with_folders(
+    manifest: &Path,
+    resolver: &dyn HeaderFolderResolver,
+) -> Result<Project> {
     let path = manifest.canonicalize().map_err(|e| {
         Diagnostic::new(
             "manifest-path",
@@ -141,15 +167,71 @@ pub fn load_project(manifest: &Path) -> Result<Project> {
             format!("cannot read {}: {e}", path.display()),
         )
     })?;
-    parse_project(&path, &text)
+    parse_project_with_folders(&path, &text, resolver)
 }
 
 pub fn parse_project(manifest: &Path, text: &str) -> Result<Project> {
+    parse_project_with_folders(manifest, text, &RejectFolderResolver)
+}
+
+pub fn parse_project_with_folders(
+    manifest: &Path,
+    text: &str,
+    resolver: &dyn HeaderFolderResolver,
+) -> Result<Project> {
+    parse_project_with_resolvers(manifest, text, resolver, &RejectStaticResolver)
+}
+
+pub fn load_project_with_imports(
+    manifest: &Path,
+    resolver: &dyn FolderResolver,
+) -> Result<Project> {
+    let path = manifest.canonicalize().map_err(|e| {
+        Diagnostic::new(
+            "manifest-path",
+            format!("cannot resolve {}: {e}", manifest.display()),
+        )
+    })?;
+    let text = fs::read_to_string(&path).map_err(|e| {
+        Diagnostic::new(
+            "manifest-read",
+            format!("cannot read {}: {e}", path.display()),
+        )
+    })?;
+    parse_project_with_imports(&path, &text, resolver)
+}
+
+pub fn parse_project_with_imports(
+    manifest: &Path,
+    text: &str,
+    resolver: &dyn FolderResolver,
+) -> Result<Project> {
+    parse_project_with_resolvers(manifest, text, resolver, resolver)
+}
+
+fn parse_project_with_resolvers(
+    manifest: &Path,
+    text: &str,
+    headers: &dyn HeaderFolderResolver,
+    statics: &dyn StaticFolderResolver,
+) -> Result<Project> {
     let raw: RawManifest = toml::from_str(text).map_err(|e| {
         let message = e.to_string();
-        let feature = ["dependencies", "workspace"]
-            .into_iter()
-            .find(|field| message.contains(&format!("unknown field `{field}`")));
+        let feature = [
+            "workspace",
+            "source",
+            "archive",
+            "path",
+            "checksum",
+            "transitive",
+            "system",
+            "external",
+            "conan",
+            "abi",
+            "options",
+        ]
+        .into_iter()
+        .find(|field| message.contains(&format!("unknown field `{field}`")));
         Diagnostic::new(
             if feature.is_some() {
                 "unsupported-manifest-feature"
@@ -206,6 +288,14 @@ pub fn parse_project(manifest: &Path, text: &str) -> Result<Project> {
     };
 
     let mut targets = Vec::new();
+    let dependencies = resolve_folder_dependencies(&root, raw.dependencies, headers, statics)?;
+    let imported_names: BTreeMap<_, _> = dependencies
+        .iter()
+        .map(|dependency| {
+            let alias = dependency.alias();
+            (alias.to_ascii_lowercase(), folder_target_name(alias))
+        })
+        .collect();
     let explicit_production = raw
         .targets
         .iter()
@@ -300,7 +390,41 @@ pub fn parse_project(manifest: &Path, text: &str) -> Result<Project> {
         }
         validate_options(&rt.compile_options, false)?;
         validate_options(&rt.link_options, true)?;
-        targets.push(Target{name:rt.name,kind,root:root_path,include_dirs,excludes,inferred:false,definitions:rt.defines,interface:exported,dependencies:rt.dependencies.into_iter().map(|(key,value)|{if !key.starts_with("target:"){return Err(Diagnostic::new("unsupported-dependency",format!("dependency {key:?} is not a same-package target; use target:<name> in M1")));} let name=&key[7..]; validate_name(name)?; let visibility=match value.as_str(){"private"=>Visibility::Private,"public"=>Visibility::Public,"interface"=>Visibility::Interface,_=>return Err(Diagnostic::new("dependency-visibility",format!("dependency {key:?} must be private, public, or interface")))}; Ok(TargetDependency{target:name.to_owned(),visibility})}).collect::<Result<Vec<_>>>()?,compile_options:rt.compile_options.into_iter().map(OsString::from).collect(),link_options:rt.link_options.into_iter().map(OsString::from).collect()});
+        let parsed_dependencies = rt.dependencies.into_iter().map(|(key, value)| {
+            let target = if let Some(name) = key.strip_prefix("target:") {
+                validate_name(name)?;
+                name.to_owned()
+            } else {
+                validate_name(&key)?;
+                imported_names.get(&key.to_ascii_lowercase()).cloned().ok_or_else(|| {
+                    Diagnostic::new(
+                        "unsupported-dependency",
+                        format!("dependency {key:?} is not a declared folder alias; use target:<name> for a same-package target"),
+                    )
+                })?
+            };
+            let visibility = match value.as_str() {
+                "private" => Visibility::Private,
+                "public" => Visibility::Public,
+                "interface" => Visibility::Interface,
+                _ => return Err(Diagnostic::new("dependency-visibility", format!("dependency {key:?} must be private, public, or interface"))),
+            };
+            Ok(TargetDependency { target, visibility })
+        }).collect::<Result<Vec<_>>>()?;
+        targets.push(Target {
+            name: rt.name,
+            origin: TargetOrigin::Local,
+            kind,
+            root: root_path,
+            include_dirs,
+            excludes,
+            inferred: false,
+            definitions: rt.defines,
+            interface: exported,
+            dependencies: parsed_dependencies,
+            compile_options: rt.compile_options.into_iter().map(OsString::from).collect(),
+            link_options: rt.link_options.into_iter().map(OsString::from).collect(),
+        });
     }
 
     if !explicit_production {
@@ -313,6 +437,7 @@ pub fn parse_project(manifest: &Path, text: &str) -> Result<Project> {
         )?;
     }
     infer_auxiliary(&root, &raw.package.name, &raw.discovery, &mut targets)?;
+    add_implicit_folder_dependencies(&mut targets, &dependencies);
     if !targets.iter().any(|t| {
         matches!(
             t.kind,
@@ -324,9 +449,6 @@ pub fn parse_project(manifest: &Path, text: &str) -> Result<Project> {
             "no production target found; add src/main.c/src/main.cpp, src/lib.c/src/lib.cpp, or declare a production target with root",
         ));
     }
-    ensure_unique_names(&targets)?;
-    resolve_dependencies(&mut targets)?;
-    validate_roots(&targets, &root)?;
     let default_target = match raw.package.default_target {
         Some(name) => {
             validate_name(&name)?;
@@ -355,6 +477,55 @@ pub fn parse_project(manifest: &Path, text: &str) -> Result<Project> {
             }
         }
     };
+    validate_import_root_overlaps(&dependencies, &targets)?;
+    for dependency in dependencies {
+        let target = match dependency {
+            ResolvedFolder::Headers(imported) => Target {
+                name: folder_target_name(&imported.alias),
+                origin: TargetOrigin::HeaderFolder {
+                    alias: imported.alias,
+                    root: imported.root,
+                    default_includes: imported.default_includes,
+                },
+                kind: TargetKind::HeaderOnly,
+                root: None,
+                include_dirs: Vec::new(),
+                excludes: Vec::new(),
+                inferred: false,
+                definitions: BTreeMap::new(),
+                interface: imported.usage,
+                dependencies: Vec::new(),
+                compile_options: Vec::new(),
+                link_options: Vec::new(),
+            },
+            ResolvedFolder::Static(imported) => Target {
+                name: folder_target_name(&imported.headers.alias),
+                origin: TargetOrigin::StaticFolder {
+                    alias: imported.headers.alias,
+                    root: imported.headers.root,
+                    default_includes: imported.headers.default_includes,
+                    library: imported.library,
+                    language: imported.language,
+                    compatibility: imported.compatibility,
+                    evidence: imported.evidence,
+                },
+                kind: TargetKind::Static,
+                root: None,
+                include_dirs: Vec::new(),
+                excludes: Vec::new(),
+                inferred: false,
+                definitions: BTreeMap::new(),
+                interface: imported.headers.usage,
+                dependencies: Vec::new(),
+                compile_options: Vec::new(),
+                link_options: Vec::new(),
+            },
+        };
+        targets.push(target);
+    }
+    ensure_unique_names(&targets)?;
+    resolve_dependencies(&mut targets)?;
+    validate_roots(&targets, &root)?;
     validate_graph(&targets)?;
     let project = Project {
         root,
@@ -481,6 +652,393 @@ fn infer_auxiliary(
     }
     Ok(())
 }
+fn add_implicit_folder_dependencies(targets: &mut [Target], dependencies: &[ResolvedFolder]) {
+    let imported: Vec<_> = dependencies
+        .iter()
+        .map(|dependency| folder_target_name(dependency.alias()))
+        .collect();
+    for target in targets.iter_mut().filter(|target| target.inferred) {
+        for dependency in &imported {
+            target.dependencies.push(TargetDependency {
+                target: dependency.clone(),
+                visibility: Visibility::Private,
+            });
+        }
+    }
+}
+
+enum ResolvedFolder {
+    Headers(HeaderFolderImport),
+    Static(StaticFolderImport),
+}
+
+impl ResolvedFolder {
+    fn alias(&self) -> &str {
+        match self {
+            Self::Headers(imported) => &imported.alias,
+            Self::Static(imported) => &imported.headers.alias,
+        }
+    }
+
+    fn root(&self) -> &Path {
+        match self {
+            Self::Headers(imported) => &imported.root,
+            Self::Static(imported) => &imported.headers.root,
+        }
+    }
+}
+
+fn resolve_folder_dependencies(
+    package_root: &Path,
+    raw: BTreeMap<String, RawFolderDependency>,
+    headers: &dyn HeaderFolderResolver,
+    statics: &dyn StaticFolderResolver,
+) -> Result<Vec<ResolvedFolder>> {
+    let mut aliases = BTreeSet::new();
+    let mut resolved = Vec::with_capacity(raw.len());
+    for (alias, dependency) in raw {
+        validate_name(&alias)?;
+        if !aliases.insert(alias.to_ascii_lowercase()) {
+            return Err(Diagnostic::new(
+                "folder-alias",
+                format!(
+                    "folder dependency alias {alias:?} duplicates another alias (names are case-insensitive)"
+                ),
+            ));
+        }
+        if dependency.provider != "folder" {
+            return Err(Diagnostic::new(
+                "unsupported-folder-provider",
+                format!(
+                    "dependency {alias:?} uses unsupported provider {:?}; this release supports provider = \"folder\" only",
+                    dependency.provider
+                ),
+            ));
+        }
+        if !matches!(dependency.kind.as_str(), "header-only" | "static") {
+            return Err(Diagnostic::new(
+                "unsupported-folder-kind",
+                format!(
+                    "dependency {alias:?} uses unsupported kind {:?}; supported kinds are \"header-only\" and \"static\"",
+                    dependency.kind
+                ),
+            ));
+        }
+        let is_static = dependency.kind == "static";
+        if !is_static
+            && (dependency.library.is_some()
+                || dependency.language.is_some()
+                || dependency.compatibility.is_some())
+        {
+            return Err(Diagnostic::new(
+                "header-only-static-field",
+                format!(
+                    "header-only dependency {alias:?} cannot declare library, language, or compatibility"
+                ),
+            ));
+        }
+        reject_symlink_path(package_root, &dependency.root, "folder dependency root")?;
+        let folder_root = resolve_inside(package_root, &dependency.root, "folder dependency root")?;
+        if !folder_root.is_dir() {
+            return Err(Diagnostic::new(
+                "folder-root",
+                format!(
+                    "folder dependency root {} is not a directory",
+                    folder_root.display()
+                ),
+            ));
+        }
+        if folder_root.starts_with(package_root.join("build/rmake")) {
+            return Err(Diagnostic::new(
+                "RMAKE-F106",
+                format!("folder dependency {alias:?} root is inside RMake-owned build/rmake"),
+            ));
+        }
+        let includes = dependency
+            .includes
+            .map(|paths| paths.into_iter().map(PathBuf::from).collect::<Vec<_>>());
+        if let Some(paths) = &includes {
+            for path in paths {
+                if path.is_absolute()
+                    || path.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(Diagnostic::new(
+                        "folder-includes",
+                        format!(
+                            "dependency {alias:?} include path {} must be relative and stay inside its root",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        for (name, value) in &dependency.defines {
+            validate_define(name, value)?;
+        }
+        if let Some(value) = &dependency.c_standard {
+            validate_standard(value, false, "dependencies.c-standard")?;
+        }
+        if let Some(value) = &dependency.cpp_standard {
+            validate_standard(value, true, "dependencies.cpp-standard")?;
+        }
+        let headers_request = HeaderFolderRequest {
+            alias: alias.clone(),
+            // Resolver contract keeps this declared path relative; canonical path is separate.
+            root: PathBuf::from(dependency.root),
+            includes,
+            definitions: dependency.defines,
+            c_standard: dependency.c_standard,
+            cpp_standard: dependency.cpp_standard,
+        };
+        let imported = if is_static {
+            let library = dependency.library.ok_or_else(|| {
+                Diagnostic::new(
+                    "folder-library",
+                    format!("static dependency {alias:?} requires library"),
+                )
+            })?;
+            let language = match dependency.language.as_deref().unwrap_or("cpp") {
+                "c" => Language::C,
+                "cpp" => Language::Cpp,
+                value => {
+                    return Err(Diagnostic::new(
+                        "folder-language",
+                        format!(
+                            "static dependency {alias:?} language must be 'c' or 'cpp', got {value:?}"
+                        ),
+                    ));
+                }
+            };
+            let compatibility = match dependency.compatibility.as_deref() {
+                Some("user-asserted") => StaticCompatibility::UserAsserted,
+                Some(value) => {
+                    return Err(Diagnostic::new(
+                        "folder-compatibility",
+                        format!(
+                            "static dependency {alias:?} compatibility must be 'user-asserted', got {value:?}"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(Diagnostic::new(
+                        "folder-compatibility",
+                        format!(
+                            "static dependency {alias:?} requires compatibility = 'user-asserted'"
+                        ),
+                    ));
+                }
+            };
+            let (expected_includes, default_includes) =
+                expected_import_includes(&folder_root, headers_request.includes.as_deref())?;
+            reject_symlink_path(&folder_root, &library, "static library")?;
+            let expected_library = resolve_inside(&folder_root, &library, "static library")?;
+            if !expected_library.is_file() {
+                return Err(Diagnostic::new(
+                    "folder-library",
+                    format!(
+                        "static dependency {alias:?} library {} is not a file",
+                        expected_library.display()
+                    ),
+                ));
+            }
+            if expected_library.starts_with(package_root.join("build/rmake")) {
+                return Err(Diagnostic::new(
+                    "folder-library-managed",
+                    format!(
+                        "static dependency {alias:?} library is inside RMake-owned build/rmake"
+                    ),
+                ));
+            }
+            let request = StaticFolderRequest {
+                headers: headers_request,
+                library: PathBuf::from(library),
+                language,
+                compatibility,
+            };
+            let imported = statics
+                .resolve_static(package_root, &request)
+                .map_err(|error| {
+                    Diagnostic::new(
+                        error.code,
+                        format!("dependency {alias:?}: {}", error.message),
+                    )
+                })?;
+            if imported.headers.alias != alias
+                || imported.headers.root != folder_root
+                || imported.headers.default_includes != default_includes
+                || imported.library != expected_library
+                || imported.language != language
+                || imported.compatibility != compatibility
+                || imported.headers.usage.definitions != request.headers.definitions
+                || imported.headers.usage.c_standard != request.headers.c_standard
+                || imported.headers.usage.cpp_standard != request.headers.cpp_standard
+                || imported.headers.usage.include_dirs != expected_includes
+                || imported.evidence.format.trim().is_empty()
+                || imported.evidence.architecture.trim().is_empty()
+                || imported.evidence.members == 0
+            {
+                return Err(Diagnostic::new(
+                    "folder-resolver-contract",
+                    format!(
+                        "static folder resolver returned inconsistent metadata for dependency {alias:?}"
+                    ),
+                ));
+            }
+            validate_imported_include_roots(alias.as_str(), &folder_root, &imported.headers.usage)?;
+            ResolvedFolder::Static(imported)
+        } else {
+            let imported = headers
+                .resolve(package_root, &headers_request)
+                .map_err(|error| {
+                    Diagnostic::new(
+                        error.code,
+                        format!("dependency {alias:?}: {}", error.message),
+                    )
+                })?;
+            if imported.alias != alias || imported.root != folder_root {
+                return Err(Diagnostic::new(
+                    "folder-resolver-contract",
+                    format!(
+                        "folder resolver returned inconsistent metadata for dependency {alias:?}"
+                    ),
+                ));
+            }
+            ResolvedFolder::Headers(imported)
+        };
+        resolved.push(imported);
+    }
+    Ok(resolved)
+}
+
+fn validate_imported_include_roots(
+    alias: &str,
+    root: &Path,
+    usage: &UsageRequirements,
+) -> Result<()> {
+    for include in &usage.include_dirs {
+        if !include.starts_with(root) || !include.is_dir() {
+            return Err(Diagnostic::new(
+                "folder-resolver-contract",
+                format!(
+                    "folder resolver returned include {} outside or missing from dependency {alias:?}",
+                    include.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expected_import_includes(
+    root: &Path,
+    requested: Option<&[PathBuf]>,
+) -> Result<(Vec<PathBuf>, bool)> {
+    let (paths, defaults): (Vec<PathBuf>, bool) = match requested {
+        Some(paths) => (paths.to_vec(), false),
+        None => {
+            let include = root.join("include");
+            let path = if include.is_dir() {
+                include
+            } else {
+                root.to_path_buf()
+            };
+            (vec![path], true)
+        }
+    };
+    let mut expected = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = path.canonicalize().map_err(|error| {
+            Diagnostic::new(
+                "folder-includes",
+                format!(
+                    "cannot resolve include directory {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if !canonical.starts_with(root) || !canonical.is_dir() {
+            return Err(Diagnostic::new(
+                "folder-includes",
+                format!(
+                    "include directory {} is outside folder root or is not a directory",
+                    path.display()
+                ),
+            ));
+        }
+        push_unique(&mut expected, canonical);
+    }
+    Ok((expected, defaults))
+}
+
+fn validate_import_root_overlaps(
+    dependencies: &[ResolvedFolder],
+    targets: &[Target],
+) -> Result<()> {
+    for imported in dependencies {
+        for target in targets
+            .iter()
+            .filter(|target| target.is_local() && target.kind != TargetKind::HeaderOnly)
+        {
+            if target
+                .root
+                .as_deref()
+                .is_some_and(|root| imported.root() == root)
+            {
+                return Err(Diagnostic::new(
+                    "folder-root-overlap",
+                    format!(
+                        "folder dependency {:?} root {} exactly matches native target {} root",
+                        imported.alias(),
+                        imported.root().display(),
+                        target.name
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct RejectFolderResolver;
+impl HeaderFolderResolver for RejectFolderResolver {
+    fn resolve(
+        &self,
+        _package_root: &Path,
+        request: &HeaderFolderRequest,
+    ) -> Result<HeaderFolderImport> {
+        Err(Diagnostic::new(
+            "missing-folder-provider",
+            format!(
+                "dependency {:?} requires a folder provider; use load_project_with_folders or parse_project_with_folders",
+                request.alias
+            ),
+        ))
+    }
+}
+
+struct RejectStaticResolver;
+impl StaticFolderResolver for RejectStaticResolver {
+    fn resolve_static(
+        &self,
+        _package_root: &Path,
+        request: &StaticFolderRequest,
+    ) -> Result<StaticFolderImport> {
+        Err(Diagnostic::new(
+            "missing-folder-provider",
+            format!(
+                "dependency {:?} requires a static folder provider; use load_project_with_imports or parse_project_with_imports",
+                request.headers.alias
+            ),
+        ))
+    }
+}
 fn excludes_for(d: &RawDiscovery) -> Vec<String> {
     d.exclude.clone()
 }
@@ -584,6 +1142,7 @@ fn inferred_target(name: &str, kind: TargetKind, root: PathBuf, excludes: &[Stri
     };
     Target {
         name: name.into(),
+        origin: TargetOrigin::Local,
         kind,
         root: Some(root),
         include_dirs: vec![source_root],
